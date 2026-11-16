@@ -2,30 +2,12 @@
     "report": {
         "type": "dict",
         "schema": {
-            "accuracy": {
-                "type": "dict",
-                "schema": {
-                    "value": {"type": "float", "min": 0, "max": 1},
-                    "CI": {"type": "float", "min": 0, "max": 1},
-                    "n": {"type": "integer", "min": 1}
-                }
-            },
-            "specificity": {
-                "type": "dict",
-                "schema": {
-                    "value": {"type": "float", "min": 0, "max": 1},
-                    "CI": {"type": "float", "min": 0, "max": 1},
-                    "n": {"type": "integer", "min": 1}
-                }
-            },
-            "sensitivity": {
-                "type": "dict",
-                "schema": {
-                    "value": {"type": "float", "min": 0, "max": 1},
-                    "CI": {"type": "float", "min": 0, "max": 1},
-                    "n": {"type": "integer", "min": 1}
-                }
-            }
+            "test": {"type": "string", "required": true},
+            "report_index": {"type": "integer", "min": 1, "required": true},
+            "report_count": {"type": "integer", "min": 1, "required": true},
+            "target_size_mb": {"type": "float", "min": 0, "required": true},
+            "target_size_bytes": {"type": "integer", "min": 0, "required": true},
+            "padding": {"type": "string", "required": true}
         }
     }
 }

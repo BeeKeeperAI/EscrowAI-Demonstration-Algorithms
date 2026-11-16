@@ -1,216 +1,309 @@
-# COVID-19 Chest X-Ray Analysis - EscrowAI Example
+# EnclaveAPI Report Size Limit Test - EscrowAI Example
 
-This example demonstrates how to perform COVID-19 diagnosis using deep learning models on chest X-ray images within EscrowAI's secure enclave environment. The application downloads chest X-ray images, applies a pre-trained COVID-19 detection model, and generates diagnostic reports while maintaining data privacy.
+This example is a test harness for the EnclaveAPI report endpoint. It posts a configurable
+number of reports of a configurable size, each with status `Completed`, using the same
+`api_v1_report_post` call that the original COVID-19 validation algorithm used. It is used to
+verify the file size limit enforced by the report endpoint and whether the 100 MB limit applies
+to each individual report or to the combined total of all reports posted by a run.
 
-## Prerequisites
+No model, data download, or validation logic is included.
 
-### Technical Requirements
-- **Python 3.8+** (for local development)
-- **Docker 20+** (for containerized testing)
-- **Bash shell** (for running scripts)
-- **Internet connection** (for downloading dependencies)
+## Environment Variables
 
-### Knowledge Requirements
-- Understanding of Docker container build system ([Docker getting-started tutorial](https://docs.docker.com/get-started/) recommended)
-- Basic Python programming knowledge
-- Familiarity with machine learning and image classification concepts
+| Variable         | Required | Default                                     | Description                                                         |
+|------------------|----------|---------------------------------------------|---------------------------------------------------------------------|
+| `REPORT_SIZE_MB` | No       | `1`                                         | Size of each report's `json_data` payload in MB. Decimals allowed.  |
+| `REPORT_COUNT`   | No       | `1`                                         | Number of reports to post in the run.                               |
+| `REPORT_INTERVAL_SECONDS` | No | `0`                                       | Seconds to sleep between consecutive report posts. Use it to measure how long the VM survives after the first `Completed` report. |
+| `REPORT_INTERMEDIATE_STATUS` | No | `In Progress`                          | Status of every report except the last, which is always `Completed`. `In Progress` is how a real algorithm posts several validated reports. Set to `Completed` to reproduce the original all-Completed runs. |
+| `ENCLAVE_URL`    | No       | `https://enclaveapi.escrow.beekeeperai.com/` | EnclaveAPI base URL.                                                |
 
-### Data Requirements
-- **COVID-19 Chest X-Ray Dataset** - Example dataset available from:
-  - [COVID-19 Chest X-ray Dataset](https://github.com/ieee8023/covid-chestxray-dataset) (GitHub)
-- Pre-trained COVID-19 detection model (included in the package)
-- **SAS URL** for accessing blob storage containing the X-ray images
+## What the Algorithm Does
 
-### Environment Variables
-The application requires the following environment variables:
+1. Reads `REPORT_SIZE_MB` and `REPORT_COUNT` and logs the planned run (per-report size, count, planned total).
+2. For each report, builds a `json_data` dict padded with printable characters so that its
+   serialized JSON size equals the requested size, then posts it with `status: "Completed"`.
+3. Logs the outcome of every post: accepted (with response and elapsed time) or rejected
+   (HTTP status, reason, and the first 500 characters of the response body).
+4. Continues to the next report after a rejection, so a run shows exactly which report in the
+   sequence was the first to fail.
+5. Prints a summary table and posts a final log line with status `Completed` (all accepted)
+   or `Failed` (at least one rejection). Exit code is `0` on full success, `2` if any report
+   was rejected, `1` for invalid configuration.
 
-- **`SAS_URL`** (Required): Shared Access Signature URL for accessing your blob storage containing chest X-ray images
-- **`ENCLAVE_URL`** (Optional): EscrowAI enclave API endpoint. Defaults to `https://enclaveapi.escrow.beekeeperai.com/`
+All milestones are also posted to the Enclave Log API so they appear in the EscrowAI run log.
 
-## What This Example Does
+## Files
 
-This example creates a container that operates within a Trusted Execution Environment to:
+1. `Dockerfile` - Container definition.
+2. `run.sh` - Entry point that runs `app.py`.
+3. `app.py` - The test harness.
+4. `requirements.txt` - Only `EnclaveSDK`.
+5. `schema.json` - Cerberus validation schema matching the test report shape. In the sandbox it
+   is attached to every report as `json_schema`. In EscrowAI production, upload this same file
+   as the validation criteria. The old COVID metrics schema (accuracy / specificity /
+   sensitivity) will **reject** these reports with "unknown field" errors, because Cerberus
+   does not allow keys that the schema does not list.
 
-1. **Download COVID-19 chest X-ray images** securely using the EnclaveSDK
-2. **Load a pre-trained deep learning model** for COVID-19 detection
-3. **Process the X-ray images** through the diagnostic model
-4. **Generate classification results** (COVID-19 positive/negative)
-5. **Create a comprehensive validation report** with model performance metrics
-6. **Post results securely** through the EnclaveAPI
+Each report's `json_data` has this shape:
 
-## Files in This Example
+```json
+{
+  "report": {
+    "test": "enclaveapi-report-size-limit",
+    "report_index": 1,
+    "report_count": 3,
+    "target_size_mb": 100.0,
+    "target_size_bytes": 104857600,
+    "padding": "abcdefghijklmnopqrstuvwxyz0123456789abc..."
+  }
+}
+```
 
-1. **`Dockerfile`** - Container environment configuration specifying the runtime environment for the enclave
-2. **`run.sh`** - Entry point script that starts the application in the Trusted Execution Environment
-3. **`app.py`** - Main Python script that uses EnclaveSDK to access secrets, process X-ray images, and generate reports
-4. **`models/multi-class-pg.pkl`** - Pre-trained COVID-19 detection model (encrypted secret)
-5. **`requirements.txt`** - Python package dependencies needed to run the application
-6. **`schema.json`** - Validation criteria file that enforces strict output requirements. In sandbox testing, this is passed as a value to validate reports. In EscrowAI production, this is loaded as validation criteria for the enclave.
+## How to Run
 
-## How to Run This Example
-
-### Option 1: Local Development
-For testing the application locally before enclave deployment:
+### Local / Sandbox
 
 ```bash
-# Navigate to the example directory
 cd example/covid-validation
-
-# Create and activate virtual environment
 python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
+source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 
-# Set environment variables (replace with your actual values)
 export ENCLAVE_URL="https://enclaveapi.escrow.beekeeperai.com/"
-export SAS_URL="your_sas_url_here"
-
-# Run the Python application directly
+export REPORT_SIZE_MB=100
+export REPORT_COUNT=3
 python app.py
 ```
 
-**Important**: When running locally, you must provide:
-- `SAS_URL`: The Shared Access Signature URL for accessing your data in the blob storage
-- `ENCLAVE_URL`: The EscrowAI enclave API endpoint (defaults to sandbox if not provided)
-
-**Note**: Local execution will use the provided SAS URL to access real data, but may have limited functionality compared to enclave execution.
-
-### Option 2: Docker Container
-Build and test the containerized version:
+### Docker
 
 ```bash
-# Navigate to the example directory
 cd example/covid-validation
-
-# Build the Docker image
-docker build -t covid-validation .
-
-# Run the container with environment variables
+docker build -t report-size-test .
 docker run --rm --network host \
   -e ENCLAVE_URL="https://enclaveapi.escrow.beekeeperai.com/" \
-  -e SAS_URL="your_sas_url_here" \
-  covid-validation
+  -e REPORT_SIZE_MB=100 \
+  -e REPORT_COUNT=3 \
+  report-size-test
 ```
 
-**Important Docker Notes:**
-- Replace `your_sas_url_here` with your actual SAS URL for blob storage access
-- The `ENCLAVE_URL` points to the EscrowAI API endpoint
-- Use `--rm` flag to automatically clean up the container after execution
+### EscrowAI Enclave
 
-### Option 3: EscrowAI Enclave (Production)
-For production deployment in the secure enclave:
+Package the directory with the Encryption Tool, upload it, and set `REPORT_SIZE_MB` and
+`REPORT_COUNT` in the run configuration. No SAS URL or dataset is required. Upload
+`schema.json` from this directory as the validation criteria; do not reuse the old COVID
+metrics schema, or every report will be rejected for schema reasons rather than size.
 
-1. **Prepare for encryption**: 
-   - Identify sensitive files like the model file (`models/multi-class-pg.pkl`) and `app.py` for encryption
-   - Keep `Dockerfile` and `run.sh` unencrypted (required by build system)
-   - Keep `requirements.txt` unencrypted if referenced directly in Dockerfile
+## Verification Steps
 
-2. **Package the algorithm**: 
-   Login to EscrowAI and use the Encryption Tool to package your entire algorithm directory and mark sensitive files for encryption. This will also transparently create your required secrets.yaml file which is a manifest of where files should be placed when they are unencrypted after loading.
+Goal: determine whether the 100 MB limit on the report endpoint is enforced per report or on
+the combined total of all reports in a run.
 
-3. **Upload to EscrowAI**: 
-   - Use the EscrowAI platform interface to upload your encrypted package
-   - Set data access permissions and SAS URL configuration
+Run each scenario below as a separate run. For every run, record from the log output:
 
-4. **Execute**: Run the COVID-19 validation within the trusted execution environment with automatic data provisioning
+- The `Planned total` line (per-report size x count).
+- For each report: `ACCEPTED` or `REJECTED`, the HTTP status on rejection, and the
+  `Cumulative accepted` value at that point.
+- The final `Accepted N/M report(s)` summary line.
 
-## Expected Results
+### Scenario 1 - Multiple reports, each exactly 100 MB
 
-Upon successful execution, you should see:
+```
+REPORT_SIZE_MB=100
+REPORT_COUNT=3
+```
 
-- **Image download progress**: Confirmation of secure data retrieval
-- **Model loading confirmation**: Successful loading of the pre-trained model
-- **Classification results**: COVID-19 positive/negative predictions for each processed X-ray image
-- **Performance metrics**: Accuracy, precision, recall, and F1-score statistics
-- **Schema validation success**: Confirmation that output meets requirements
-- **Final diagnostic report**: Submission status and report summary
+Planned total: 300 MB.
+
+- If every report is accepted: the limit is not a hard 100 MB per report, and it is not a 100 MB total.
+- If the first report is rejected: the limit is below or at 100 MB per report (the request body
+  is slightly larger than 100 MB because of the `name` and `status` fields). Re-run with
+  `REPORT_SIZE_MB=99` to confirm.
+- If report 1 is accepted but report 2 is rejected: the limit is enforced on the cumulative total.
+
+### Scenario 2 - Multiple reports, each within 100 MB, combined total above 100 MB
+
+```
+REPORT_SIZE_MB=50
+REPORT_COUNT=3
+```
+
+Planned total: 150 MB.
+
+- All three accepted: the limit is per report, not total.
+- Reports 1 and 2 accepted (100 MB cumulative), report 3 rejected: the limit is on the total.
+
+### Scenario 3 - Multiple small reports, combined total below 100 MB
+
+```
+REPORT_SIZE_MB=10
+REPORT_COUNT=5
+```
+
+Planned total: 50 MB. This is the control case. All five reports are expected to be accepted
+under either interpretation of the limit. If any are rejected, the failure is not caused by the
+100 MB limit; check the HTTP status and body in the log.
+
+### Scenario 4 - Multiple small reports, combined total above 100 MB
+
+```
+REPORT_SIZE_MB=30
+REPORT_COUNT=5
+```
+
+Planned total: 150 MB.
+
+- All five accepted: the limit is per report.
+- Reports 1 to 3 accepted (90 MB cumulative) and report 4 rejected (would reach 120 MB): the
+  limit is on the total.
+
+### Interpreting the results
+
+| Scenario | Per-report limit expected | Total limit expected                     |
+|----------|---------------------------|------------------------------------------|
+| 1        | 3/3 or 0/3 accepted       | 1/3 accepted                             |
+| 2        | 3/3 accepted              | 2/3 accepted                             |
+| 3        | 5/5 accepted              | 5/5 accepted                             |
+| 4        | 5/5 accepted              | 3/5 accepted                             |
+
+Any result where the first rejection lines up with the cumulative total crossing 100 MB
+indicates a total-payload limit. Any result where rejections depend only on `REPORT_SIZE_MB`,
+regardless of count, indicates a per-report limit.
+
+### What EnclaveAPI actually enforces (from the EnclaveAPI source)
+
+The `POST /api/v1/report` handler in EnclaveAPI behaves differently depending on where it runs:
+
+| Where                           | Size check in EnclaveAPI                                   | What happens to the report                                                                 |
+|---------------------------------|------------------------------------------------------------|--------------------------------------------------------------------------------------------|
+| Hosted sandbox (Auth0 enabled)  | `Content-Length > 100 MB` returns HTTP 413, per request    | Validated against the attached `json_schema`, then discarded. Nothing is forwarded.         |
+| Enclave / TEE (no Auth0)        | None. Above 10 MB it only posts a warning to the run log   | `json_data` is base64-encoded (size x 4/3) and forwarded to the EscrowAI backend           |
+
+So in the sandbox the 100 MB limit is per report, measured on the raw request body, with no
+cumulative total. In an enclave EnclaveAPI imposes no limit itself; whatever rejects a large
+report is the EscrowAI backend or a proxy in front of it. EnclaveAPI surfaces that as HTTP 500
+to the algorithm, and the run log shows the upstream status in an `AO:` line, for example
+`EscrowAI rejected the report with status code 502`. An empty 502 body after roughly 60 seconds
+points to an upstream gateway or worker timeout rather than an explicit size check.
+
+Observed in the dev enclave on 2026-10-20: single reports of 95 MB and 50 MB were both
+rejected with an upstream 502. Root cause, confirmed from the Application Gateway access log
+and the frontoffice App Service console log:
+
+- The gateway forwarded every report to the backend with no WAF action
+  (`serverRouted` populated, `ERRORINFO_NO_ERROR`), and the 502 came from the backend.
+- At the same timestamps the frontoffice gunicorn log shows
+  `Worker (pid:N) was sent SIGKILL! Perhaps out of memory?` followed by a new worker booting.
+- The report view decodes and re-serializes the whole payload several times in memory, so
+  peak memory is a multiple of the report size and exceeds the App Service instance's headroom.
+
+Observed in the staging enclave on 2026-11-02: a single 100 MB report was rejected with
+HTTP 400 from the backend: `Report JSON is invalid: JSON string exceeds max size of
+104857600 bytes`. This is the frontoffice's `secure_json_parse` check, which refuses any
+report whose decoded `json_data` JSON exceeds 100 MiB. EnclaveAPI relays it to the algorithm
+as HTTP 500 with the real message in the run log. Note that EnclaveAPI re-serializes
+`json_data` in Go and, for a Completed report in a validation run, adds a `type` field, so
+the backend's byte count differs from this script's by a few tens of bytes. Keep test sizes a
+few kilobytes under 100 MiB (for example `REPORT_SIZE_MB=99.9`) rather than exactly at it.
+
+Also on 2026-11-02 in staging: a single 99.8 MB report was accepted, and a run with
+`REPORT_SIZE_MB=99.8` and `REPORT_COUNT=2` had both reports accepted and stored (the run's
+Report Details shows two reports of 99.80 MB each, 199.6 MB combined). Together with the
+100 MB rejection this brackets the limit at 100 MiB of decoded report JSON, per report, with no
+cumulative limit.
+
+Two platform behaviours to be aware of when reading multi-report runs:
+
+- The first report posted with status `Completed` marks the run as ended and queues the VM
+  destroy. The destroy is an Azure DevOps pipeline run, so the VM survives for several more
+  minutes while that pipeline queues and executes. Later reports are still accepted during that
+  window, because the backend saves reports against an ended run and skips the destroy. This is
+  why posting several `Completed` reports back to back appears to work (2 and 4 reports of
+  99.8 MB were all stored in staging). It depends entirely on pipeline latency: a run that pauses
+  between reports will lose the VM mid-run and the remaining reports will never be sent. A real
+  algorithm should post intermediate reports as `In Progress` and only the final one as
+  `Completed`.
+
+  The destroy pipeline for a CVM run has two stages (`terraform_validate`, then
+  `terraform_destroy`), each a separate Azure DevOps job that must acquire an agent, check out
+  the repo, install terraform, run `terraform init` against remote state, and then destroy the
+  VM, NIC, disk and public IP. That is typically in the range of 5 to 10 minutes end to end,
+  but it has not been measured here and it varies with agent-pool availability. To measure it
+  on a given environment, run with `REPORT_INTERVAL_SECONDS` set (for example `REPORT_COUNT=3`
+  and `REPORT_INTERVAL_SECONDS=240`) and compare the timestamp of the first report against the
+  `VM Destroyed` line that the pipeline posts to the run log. Reports whose sleep ends after
+  that line are lost, not rejected: the process dies with the VM and nothing is sent.
+
+  Observed in staging on 2026-11-03: a run with `REPORT_COUNT=10` posted back to back ended
+  with 5 reports stored and no rejection lines in the run log. That is consistent with the VM
+  being destroyed while report 6 was in flight, roughly 5 to 8 minutes after report 1. A second
+  run the same day with `REPORT_SIZE_MB=5` and `REPORT_COUNT=100` stored 15 reports (about
+  75 MB in total) before the cutoff. Taken together: the cutoff is neither a report count nor a
+  cumulative size, because 5 reports totalling about 499 MB and 15 reports totalling about
+  75 MB were cut off at roughly the same elapsed time. It is the VM lifetime after the first
+  `Completed` report. Any algorithm that keeps posting after its first `Completed` report is
+  subject to the same cutoff.
+- Every log posted after the run has ended has its status overwritten to `Completed` by the
+  backend, and the web UI's run log download drops all logs with that status. So the script's
+  "accepted" and summary lines for a multi-report run are stored but do not appear in the
+  downloaded log. Use the run's Report Details view, or query the log endpoint for the run, to
+  see the outcome.
+
+Conclusion:
+
+- The 100 MB check inside EnclaveAPI applies only to the hosted sandbox, per request.
+- In an enclave the limit is the backend's 100 MiB check on the decoded report JSON, enforced
+  per report. There is no cumulative limit on any hop.
+- Dev can fail earlier than that, with a 502 and no message, because its App Service worker
+  runs out of memory while decoding large reports before the explicit check is reached.
+
+### Scenario 5 - Many small reports with intermediate `In Progress` status (Dev / QA safe)
+
+This is the scenario for environments whose App Service has little memory headroom, such as
+Dev and QA, where a single large report already causes a worker OOM. It tests report *count*
+rather than report *size*, and it exercises the intended contract: intermediate reports are
+posted as `In Progress`, only the last one as `Completed`.
+
+```
+REPORT_SIZE_MB=1
+REPORT_COUNT=100
+REPORT_INTERMEDIATE_STATUS="In Progress"   # the default
+```
+
+Planned total: 100 MB, but the backend only ever holds one 1 MB report in memory at a time.
+
+Expected with an EnclaveAPI build that validates and tags `In Progress` reports (branch
+`kurian/disk-mode-decryption`, commit `00c4739` or later): all 100 reports stored, all 100
+listed in Report Details, the run ends only after report 100, and no VM-destroy race because
+nothing ends the run early. Reports 1 to 99 appear with status `In Progress` and report 100
+with `Completed`.
+
+With an older EnclaveAPI build the same run still stores all 100 reports, but Report Details
+lists only report 100, because only `Completed` reports were tagged `validated_report`. Count
+the rows in the backend report table, or query the report endpoint for the run, to confirm the
+other 99 arrived.
+
+If Dev or QA still fails partway through, the failure is a per-request cost on the backend
+(one report row, one base64 decode, one schema validation, and one Report Details query per
+post), not a size limit. Bisect with `REPORT_COUNT` to find the count at which it breaks and
+record the backend worker log at that time.
+
+### Finding the exact per-report limit
+
+If scenario 1 rejects every report, bisect with `REPORT_COUNT=1` and decreasing
+`REPORT_SIZE_MB` (for example 99, 95, 90) until a report is accepted. The reported
+`full body` size in the log is the exact request size sent, including the `name` and `status`
+fields.
 
 ## Troubleshooting
 
-### Common Issues
-
-**SAS URL Issues:**
-- **Problem**: `SAS_URL` environment variable not set or invalid
-- **Solution**: Ensure the `SAS_URL` environment variable is properly set and contains a valid Shared Access Signature URL
-- **Verification**: Check that the SAS URL has read and list permissions for the blob storage container
-- **Check expiration**: Verify that the SAS URL has not expired
-
-**Model Loading Errors:**
-- **Problem**: Cannot load `multi-class-pg.pkl` file
-- **Solution**: Ensure the model file is properly encrypted and accessible in the `models/` directory
-- **Check permissions**: Verify file permissions and encryption status
-
-**Image Processing Failures:**
-- **Problem**: Error processing X-ray images
-- **Solution**: Verify that the input images are in the correct format (typically PNG or JPEG)
-- **Check data**: Ensure images are accessible through the SAS URL and not corrupted
-
-**Docker Build Issues:**
-- **Problem**: Docker build fails or takes too long
-- **Solution**: Check that all dependencies in `requirements.txt` are compatible
-- **Network**: Ensure stable internet connection for downloading dependencies
-- **Permissions**: Verify Docker daemon is running with sufficient permissions
-
-**Schema Validation Errors:**
-- **Problem**: Output doesn't match schema requirements
-- **Solution**: Review the output format against the `schema.json` requirements
-- **Debug**: Check the generated report structure and data types
-
-**EnclaveSDK Connection Issues:**
-- **Problem**: Cannot connect to EscrowAI API
-- **Solution**: Verify that the `ENCLAVE_URL` is correct and accessible
-- **Network**: Check internet connectivity and firewall settings
-- **Configuration**: Ensure the enclave environment is properly configured
-
-**Environment Variable Errors:**
-- **Problem**: Required environment variables not found
-- **Solution**: Ensure all required environment variables (`SAS_URL`) are set before running the application
-- **Verification**: Use `env | grep -E "(ENCLAVE_URL|SAS_URL)"` to check current settings
-
-### Verification Commands
-
-```bash
-# Check environment variables
-env | grep -E "(ENCLAVE_URL|SAS_URL)"
-
-# Test Docker build
-docker build -t test-covid-validation .
-
-# Verify Python dependencies
-python -c "import pandas, numpy, sklearn; print('Dependencies imported successfully')"
-
-# Test SAS URL format (basic check)
-echo $SAS_URL | grep -q "https://" && echo "SAS URL format looks correct" || echo "SAS URL may be malformed"
-
-# Check model file exists
-ls -la models/multi-class-pg.pkl
-```
-
-### Debug Mode
-
-For additional debugging information, you can modify the `app.py` to include more verbose logging:
-
-```bash
-# Add debug environment variable
-export DEBUG=true
-
-# Run with debug output
-python app.py
-```
-
-## Integration with Other Examples
-
-This COVID validation example can be combined with other examples in this repository:
-
-- **Use with Breast Cancer Training**: Apply similar deep learning techniques to different medical imaging tasks
-- **Combine with Diabetes Analysis**: Create comprehensive health analytics workflows
-- **Template Integration**: Use as a reference for implementing other image classification tasks
-
-## Support and Resources
-
-- **Docker Getting Started**: https://docs.docker.com/get-started/
-- **Scikit-learn Documentation**: https://scikit-learn.org/stable/
+- **HTTP 413**: the request body exceeded a size limit on the API or a proxy in front of it.
+- **HTTP 400 / 422**: the report was rejected for validation reasons rather than size; the
+  response body in the log explains why.
+- **Connection reset or timeout on large reports**: an intermediate proxy may be closing the
+  connection before the API responds. The log shows the elapsed time at the point of failure.
+- **Memory**: each report is built in memory. A 100 MB report needs roughly 300 MB of RAM
+  while it is serialized and sent.
 
 For technical support, contact BeeKeeperAI.
