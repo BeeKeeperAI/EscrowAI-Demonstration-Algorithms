@@ -1,0 +1,2 @@
+pydicom==2.4.4
+EnclaveSDK==1.5.8

@@ -1,0 +1,33 @@
+{
+    "report": {
+        "type": "dict",
+        "required": true,
+        "schema": {
+            "entries_listed": {"type": "integer", "required": true, "min": 0},
+            "total_folders": {"type": "integer", "required": true, "min": 0},
+            "total_files": {"type": "integer", "required": true, "min": 0},
+            "non_dicom_files_skipped": {"type": "integer", "required": true, "min": 0},
+            "folders": {
+                "type": "list",
+                "required": true,
+                "schema": {
+                    "type": "dict",
+                    "schema": {
+                        "folder": {"type": "string", "required": true},
+                        "file_count": {"type": "integer", "required": true, "min": 1}
+                    }
+                }
+            },
+            "modalities": {
+                "type": "list",
+                "schema": {
+                    "type": "dict",
+                    "schema": {
+                        "modality": {"type": "string", "required": true},
+                        "file_count": {"type": "integer", "required": true, "min": 1}
+                    }
+                }
+            }
+        }
+    }
+}
