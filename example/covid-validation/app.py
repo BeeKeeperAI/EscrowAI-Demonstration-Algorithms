@@ -30,6 +30,20 @@ REPORT_FINAL_STATUS
                  posted as "In Progress" (a "Completed" log line ends the run
                  too), so the run only ends when the VM runner posts its own
                  "Completed" report after the algorithm container exits.
+REPORT_FAIL_AT   Comma-separated 1-based indexes of reports to post deliberately
+                 invalid, for example "49" or "49,50". Default: none. Used to
+                 observe what the platform does when one report in a sequence
+                 is rejected. A rejection of one of these reports counts as the
+                 expected outcome; the harness only exits non-zero when an
+                 outcome is unexpected (an injected report accepted, or a
+                 normal report rejected).
+REPORT_FAIL_MODE How an injected report is made invalid. "schema" (default)
+                 replaces the "report" object with a string, which fails any
+                 schema that types "report" as a dict, so EnclaveAPI answers
+                 400 and does not forward it. "oversize" pads json_data past
+                 the 100 MiB per-report limit, so an EnclaveAPI build with the
+                 size pre-check answers 413; an older build forwards ~134 MB
+                 of base64 to the backend, which Dev and QA cannot decode.
 ENCLAVE_URL      EnclaveAPI base URL. Default: https://enclaveapi.escrow.beekeeperai.com/
 
 Status values are matched ignoring case, spaces, underscores and hyphens, so
@@ -90,7 +104,22 @@ def normalize_status(raw: str) -> str:
 
 REPORT_INTERMEDIATE_STATUS = normalize_status(os.getenv("REPORT_INTERMEDIATE_STATUS", "In Progress"))
 REPORT_FINAL_STATUS = normalize_status(os.getenv("REPORT_FINAL_STATUS", "Completed"))
+REPORT_FAIL_AT_RAW = os.getenv("REPORT_FAIL_AT", "")
+REPORT_FAIL_MODE = os.getenv("REPORT_FAIL_MODE", "schema").strip().lower()
+VALID_FAIL_MODES = ("schema", "oversize")
+# One MiB past the backend's 100 MiB per-report limit on the decoded JSON.
+OVERSIZE_TARGET_BYTES = 101 * MB
 SCHEMA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema.json")
+
+
+def parse_fail_at(raw: str):
+    """Parse "49,50" into {49, 50}. Raises ValueError on anything non-numeric."""
+    indexes = set()
+    for part in raw.replace(";", ",").split(","):
+        part = part.strip()
+        if part:
+            indexes.add(int(part))
+    return indexes
 
 configuration = EnclaveSDK.Configuration(ENCLAVE_URL)
 api_client = EnclaveSDK.ApiClient(configuration)
@@ -199,6 +228,28 @@ def main() -> int:
         )
         post_log(f"Invalid REPORT_FINAL_STATUS={REPORT_FINAL_STATUS!r}", "Failed")
         return 1
+    try:
+        fail_at = parse_fail_at(REPORT_FAIL_AT_RAW)
+    except ValueError:
+        log.error("REPORT_FAIL_AT must be a comma-separated list of report indexes (got %r)", REPORT_FAIL_AT_RAW)
+        post_log(f"Invalid REPORT_FAIL_AT={REPORT_FAIL_AT_RAW!r}", "Failed")
+        return 1
+    out_of_range = sorted(i for i in fail_at if i < 1 or i > REPORT_COUNT)
+    if out_of_range:
+        log.error(
+            "REPORT_FAIL_AT indexes must be between 1 and REPORT_COUNT=%d (got %s)",
+            REPORT_COUNT, out_of_range,
+        )
+        post_log(
+            f"Invalid REPORT_FAIL_AT={REPORT_FAIL_AT_RAW!r}: {out_of_range} out of range for "
+            f"REPORT_COUNT={REPORT_COUNT}",
+            "Failed",
+        )
+        return 1
+    if REPORT_FAIL_MODE not in VALID_FAIL_MODES:
+        log.error("REPORT_FAIL_MODE must be one of %s (got %r)", VALID_FAIL_MODES, REPORT_FAIL_MODE)
+        post_log(f"Invalid REPORT_FAIL_MODE={REPORT_FAIL_MODE!r}", "Failed")
+        return 1
 
     target_bytes = int(REPORT_SIZE_MB * MB)
     total_planned_mb = REPORT_SIZE_MB * REPORT_COUNT
@@ -215,15 +266,21 @@ def main() -> int:
             "own Completed report after this container exits"
         )
     log.info("Planned total  = %.2f MB across %d report(s)", total_planned_mb, REPORT_COUNT)
+    if fail_at:
+        log.info("REPORT_FAIL_AT = %s (mode %s): these reports are posted deliberately invalid", sorted(fail_at), REPORT_FAIL_MODE)
     post_log(
         f"Starting report size test: {REPORT_COUNT} report(s) x {REPORT_SIZE_MB} MB "
         f"(planned total {total_planned_mb:.2f} MB, {REPORT_INTERVAL_SECONDS}s between reports, "
-        f"intermediate status {REPORT_INTERMEDIATE_STATUS!r}, final status {REPORT_FINAL_STATUS!r})",
+        f"intermediate status {REPORT_INTERMEDIATE_STATUS!r}, final status {REPORT_FINAL_STATUS!r}"
+        + (f", deliberately invalid report(s) {sorted(fail_at)} via {REPORT_FAIL_MODE}" if fail_at else "")
+        + ")",
         "In Progress",
     )
 
     successes = 0
-    failures = 0
+    failures = 0            # normal reports rejected or errored
+    expected_rejections = 0  # injected reports rejected, as intended
+    unexpected_accepts = 0   # injected reports accepted, which should not happen
     bytes_sent_ok = 0
     results = []
 
@@ -244,9 +301,23 @@ def main() -> int:
         # the VM destroy. REPORT_FINAL_STATUS="In Progress" makes every report
         # In Progress and leaves ending the run to the VM runner.
         report_status = REPORT_FINAL_STATUS if i == REPORT_COUNT else REPORT_INTERMEDIATE_STATUS
-        log.info("--- Report %d/%d: building payload ---", i, REPORT_COUNT)
+        inject = i in fail_at
+        log.info(
+            "--- Report %d/%d: building payload%s ---", i, REPORT_COUNT,
+            f" (DELIBERATELY INVALID, mode={REPORT_FAIL_MODE})" if inject else "",
+        )
         t_build = time.perf_counter()
-        json_data = build_json_data(i, target_bytes)
+        if inject and REPORT_FAIL_MODE == "schema":
+            # Any schema that types "report" as a dict rejects a string here, so
+            # this fails validation whatever schema the project was created with.
+            json_data = {
+                "report": (
+                    f"deliberately invalid report {i}/{REPORT_COUNT}: 'report' is a string "
+                    "where the schema requires an object"
+                )
+            }
+        else:
+            json_data = build_json_data(i, OVERSIZE_TARGET_BYTES if inject else target_bytes)
         final_report = {
             "json_data": json_data,
             "name": name,
@@ -273,41 +344,78 @@ def main() -> int:
         try:
             response = post_report(final_report)
             elapsed = time.perf_counter() - t_post
-            successes += 1
-            bytes_sent_ok += body_bytes
-            log.info(
-                "Report %d/%d: ACCEPTED in %.2fs. Response: %s",
-                i, REPORT_COUNT, elapsed, response,
-            )
-            post_log(
-                f"Report {i}/{REPORT_COUNT} accepted ({body_bytes / MB:.2f} MB, "
-                f"{elapsed:.2f}s). Cumulative accepted: {bytes_sent_ok / MB:.2f} MB",
-                "In Progress",
-            )
-            results.append({"index": i, "bytes": body_bytes, "result": "accepted", "seconds": round(elapsed, 2)})
+            if inject:
+                unexpected_accepts += 1
+                log.error(
+                    "Report %d/%d: ACCEPTED in %.2fs although it was deliberately invalid (mode=%s). Response: %s",
+                    i, REPORT_COUNT, elapsed, REPORT_FAIL_MODE, response,
+                )
+                post_log(
+                    f"Report {i}/{REPORT_COUNT} was deliberately invalid ({REPORT_FAIL_MODE}) but EnclaveAPI "
+                    f"ACCEPTED it ({body_bytes / MB:.2f} MB, {elapsed:.2f}s)",
+                    "In Progress",
+                )
+                results.append({"index": i, "bytes": body_bytes, "result": "accepted (UNEXPECTED, injected failure)", "seconds": round(elapsed, 2)})
+            else:
+                successes += 1
+                bytes_sent_ok += body_bytes
+                log.info(
+                    "Report %d/%d: ACCEPTED in %.2fs. Response: %s",
+                    i, REPORT_COUNT, elapsed, response,
+                )
+                post_log(
+                    f"Report {i}/{REPORT_COUNT} accepted ({body_bytes / MB:.2f} MB, "
+                    f"{elapsed:.2f}s). Cumulative accepted: {bytes_sent_ok / MB:.2f} MB",
+                    "In Progress",
+                )
+                results.append({"index": i, "bytes": body_bytes, "result": "accepted", "seconds": round(elapsed, 2)})
         except ApiException as exc:
             elapsed = time.perf_counter() - t_post
-            failures += 1
             body_preview = (exc.body or "")[:500] if isinstance(exc.body, str) else str(exc.body)[:500]
-            log.error(
-                "Report %d/%d: REJECTED in %.2fs. HTTP %s %s. Body: %s",
-                i, REPORT_COUNT, elapsed, exc.status, exc.reason, body_preview,
-            )
-            post_log(
-                f"Report {i}/{REPORT_COUNT} rejected ({body_bytes / MB:.2f} MB): "
-                f"HTTP {exc.status} {exc.reason}. Cumulative accepted before this: {bytes_sent_ok / MB:.2f} MB",
-                "In Progress",
-            )
-            results.append({"index": i, "bytes": body_bytes, "result": f"rejected HTTP {exc.status}", "seconds": round(elapsed, 2)})
+            if inject:
+                expected_rejections += 1
+                log.info(
+                    "Report %d/%d: rejected as intended in %.2fs. HTTP %s %s. Body: %s",
+                    i, REPORT_COUNT, elapsed, exc.status, exc.reason, body_preview,
+                )
+                post_log(
+                    f"Report {i}/{REPORT_COUNT} was deliberately invalid ({REPORT_FAIL_MODE}) and was rejected "
+                    f"as intended: HTTP {exc.status} {exc.reason}. Continuing with the next report.",
+                    "In Progress",
+                )
+                results.append({"index": i, "bytes": body_bytes, "result": f"rejected HTTP {exc.status} (expected)", "seconds": round(elapsed, 2)})
+            else:
+                failures += 1
+                log.error(
+                    "Report %d/%d: REJECTED in %.2fs. HTTP %s %s. Body: %s",
+                    i, REPORT_COUNT, elapsed, exc.status, exc.reason, body_preview,
+                )
+                post_log(
+                    f"Report {i}/{REPORT_COUNT} rejected ({body_bytes / MB:.2f} MB): "
+                    f"HTTP {exc.status} {exc.reason}. Cumulative accepted before this: {bytes_sent_ok / MB:.2f} MB",
+                    "In Progress",
+                )
+                results.append({"index": i, "bytes": body_bytes, "result": f"rejected HTTP {exc.status}", "seconds": round(elapsed, 2)})
         except Exception as exc:  # noqa: BLE001 - connection errors, timeouts, etc.
             elapsed = time.perf_counter() - t_post
-            failures += 1
-            log.exception("Report %d/%d: ERROR after %.2fs: %s", i, REPORT_COUNT, elapsed, exc)
-            post_log(
-                f"Report {i}/{REPORT_COUNT} error ({body_bytes / MB:.2f} MB): {type(exc).__name__}: {exc}",
-                "In Progress",
-            )
-            results.append({"index": i, "bytes": body_bytes, "result": f"error {type(exc).__name__}", "seconds": round(elapsed, 2)})
+            if inject:
+                # A dropped connection on a deliberately oversized report is still a rejection.
+                expected_rejections += 1
+                log.warning("Report %d/%d: error after %.2fs on a deliberately invalid report: %s: %s", i, REPORT_COUNT, elapsed, type(exc).__name__, exc)
+                post_log(
+                    f"Report {i}/{REPORT_COUNT} was deliberately invalid ({REPORT_FAIL_MODE}) and failed with "
+                    f"{type(exc).__name__}: {exc}. Continuing with the next report.",
+                    "In Progress",
+                )
+                results.append({"index": i, "bytes": body_bytes, "result": f"error {type(exc).__name__} (injected failure)", "seconds": round(elapsed, 2)})
+            else:
+                failures += 1
+                log.exception("Report %d/%d: ERROR after %.2fs: %s", i, REPORT_COUNT, elapsed, exc)
+                post_log(
+                    f"Report {i}/{REPORT_COUNT} error ({body_bytes / MB:.2f} MB): {type(exc).__name__}: {exc}",
+                    "In Progress",
+                )
+                results.append({"index": i, "bytes": body_bytes, "result": f"error {type(exc).__name__}", "seconds": round(elapsed, 2)})
 
     # -----------------------------------------------------------------------
     # Summary
@@ -316,19 +424,30 @@ def main() -> int:
     for r in results:
         log.info("  report %d: %.2f MB -> %s (%.2fs)", r["index"], r["bytes"] / MB, r["result"], r["seconds"])
     log.info(
-        "Accepted %d/%d report(s); rejected/errored %d; accepted total %.2f MB of planned %.2f MB",
-        successes, REPORT_COUNT, failures, bytes_sent_ok / MB, total_planned_mb,
+        "Accepted %d/%d report(s); rejected/errored %d; deliberately invalid and rejected %d; "
+        "deliberately invalid but accepted %d; accepted total %.2f MB of planned %.2f MB",
+        successes, REPORT_COUNT, failures, expected_rejections, unexpected_accepts,
+        bytes_sent_ok / MB, total_planned_mb,
     )
 
+    # Only unexpected outcomes count as a harness failure: a normal report that
+    # was rejected, or an injected report that was accepted. An injected report
+    # being rejected is the point of the scenario, so it does not fail the run
+    # from the harness's side; whatever the platform does about it is the
+    # observation.
+    problems = failures + unexpected_accepts
     # A "Completed" log line ends the run just like a "Completed" report does, so
     # when no report is meant to end the run the closing log stays "In Progress".
-    final_status = REPORT_FINAL_STATUS if failures == 0 else "Failed"
+    final_status = REPORT_FINAL_STATUS if problems == 0 else "Failed"
     post_log(
         f"Report size test finished: accepted {successes}/{REPORT_COUNT} x {REPORT_SIZE_MB} MB "
-        f"(accepted total {bytes_sent_ok / MB:.2f} MB, planned {total_planned_mb:.2f} MB)",
+        f"(accepted total {bytes_sent_ok / MB:.2f} MB, planned {total_planned_mb:.2f} MB)"
+        + (f"; {expected_rejections} deliberately invalid report(s) rejected as intended" if fail_at else "")
+        + (f"; {unexpected_accepts} deliberately invalid report(s) ACCEPTED" if unexpected_accepts else "")
+        + (f"; {failures} normal report(s) rejected or errored" if failures else ""),
         final_status,
     )
-    return 0 if failures == 0 else 2
+    return 0 if problems == 0 else 2
 
 
 if __name__ == "__main__":

@@ -17,6 +17,8 @@ No model, data download, or validation logic is included.
 | `REPORT_INTERVAL_SECONDS` | No | `0`                                       | Seconds to sleep between consecutive report posts. Use it to measure how long the VM survives after the first `Completed` report. |
 | `REPORT_INTERMEDIATE_STATUS` | No | `In Progress`                          | Status of every report except the last. `In Progress` is how a real algorithm posts several validated reports. Set to `Completed` to reproduce the original all-Completed runs. |
 | `REPORT_FINAL_STATUS` | No  | `Completed`                                 | Status of the last report. Set to `InProgress` to post every report as `In Progress`; the closing log line is then also `In Progress` and the run ends only when the VM runner posts its own `Completed` report after the container exits. |
+| `REPORT_FAIL_AT` | No       | none                                        | Comma-separated 1-based indexes of reports to post deliberately invalid, e.g. `49` or `49,50`. A rejection of one of these is the expected outcome and does not fail the harness. |
+| `REPORT_FAIL_MODE` | No     | `schema`                                    | `schema` replaces the `report` object with a string so schema validation rejects it (EnclaveAPI 400, not forwarded). `oversize` pads the report past 100 MiB (EnclaveAPI 413 on builds with the size pre-check). Avoid `oversize` on Dev/QA with older EnclaveAPI builds. |
 | `ENCLAVE_URL`    | No       | `https://enclaveapi.escrow.beekeeperai.com/` | EnclaveAPI base URL.                                                |
 
 Status values are matched ignoring case, spaces, underscores and hyphens, so `InProgress`,
@@ -334,6 +336,67 @@ If Dev or QA still fails partway through, the failure is a per-request cost on t
 (one report row, one base64 decode, one schema validation, and one Report Details query per
 post), not a size limit. Bisect with `REPORT_COUNT` to find the count at which it breaks and
 record the backend worker log at that time.
+
+### Scenario 6 - One report in the middle of the sequence is rejected
+
+Branch `develop/covid-report-failure-midrun`. The question is what the platform does when, say,
+report 49 of 100 is rejected while the algorithm keeps going.
+
+```
+REPORT_SIZE_MB=1
+REPORT_COUNT=100
+REPORT_FAIL_AT=49            # or 49,50
+REPORT_FAIL_MODE=schema      # the default
+REPORT_FINAL_STATUS=Completed  # the default; use "In Progress" (quoted) for the all-In-Progress variant
+```
+
+Report 49 is posted with `"report"` set to a string instead of an object, which fails any schema
+that types `report` as a dict. The harness treats the rejection as the expected outcome, logs it,
+and continues with report 50. Its exit code and closing log status stay as for a clean run, so
+everything that happens to the run afterwards is the platform's doing, not the harness's.
+
+Predicted from the code (EnclaveAPI `PostApiV1Report`, backend `frontoffice_log` and
+`frontoffice_report` views), to be confirmed on Dev:
+
+1. **Reports 1 to 48** are validated, tagged and stored as `In Progress`, as in scenario 5.
+2. **Report 49** is sent to Cerberus, fails, and EnclaveAPI answers `400` with the Cerberus
+   message. The report is never forwarded, so there is no row for it. The harness run log shows
+   `Report 49/100 was deliberately invalid (schema) and was rejected as intended: HTTP 400`.
+3. **The run is marked failed right there.** Alongside the 400, EnclaveAPI posts an internal log
+   line `AO: Your report failed schema validation: ...` with status **`Failed`**. The backend
+   treats a `Failed` log line as an end state exactly like a `Failed` report: run status becomes
+   `run-failed`, the end date is set, the failure notification and email go out, and the VM
+   destroy pipeline is queued. That happens about 30 seconds into the sequence, before report 50
+   is posted.
+4. **Reports 50 to 100 are still accepted and stored.** The harness keeps posting, EnclaveAPI
+   validates and forwards them, and the backend stores them. But because the run has ended,
+   the backend rewrites the status of every later report and log to the run's end status, so
+   reports 50 to 100 are stored with status `Failed` rather than `In Progress`, and the final
+   report's `Completed` is rewritten to `Failed` too. They remain tagged `validated_report`, so
+   they are listed in Report Details (first 15 only, see above) with status `Failed`.
+5. **Nothing is lost to the destroy race** at this size: the remaining 51 reports take about
+   35 seconds and the destroy pipeline takes minutes. With larger or slower reports, anything
+   still posting when the VM goes away is lost, as in scenario 4.
+6. **Harness exit and VM runner.** The harness exits 0 (the rejection was expected) and posts
+   its closing log line; with the run already ended, its status is rewritten to `Failed`. The
+   VM runner then drains EnclaveAPI and posts `Completed` / `The run has completed`, which is
+   also rewritten to `Failed` and logged as "run already ended, will skip destroy".
+
+Net effect: one schema-invalid report anywhere in the sequence fails the whole run, even though
+every other report is stored. The final run status is **Run Failed**, with 48 `In Progress`
+reports, no report 49, and 51 reports whose stored status is `Failed`.
+
+Contrast with `REPORT_FAIL_MODE=oversize`: the size pre-check in EnclaveAPI (`00c4739` or later)
+answers `413` and logs the size message with status **`In Progress`**, not `Failed`. The run
+continues, report 49 is simply missing, and the run ends normally on report 100 as
+**Run Completed**. So today a schema failure fails the run and a size failure does not. Whether
+a rejected intermediate report should fail a run at all is a platform decision; the algorithm
+receives the 400 and could repair and resend, but the `Failed` log line has already ended the run
+by the time it does.
+
+Things to check after the Dev run: the run status badge, the Date Ended (it should match the
+report 49 timestamp, not report 100), the stored status of reports 50 to 100 via the report
+endpoint, and whether a failure email arrived.
 
 ### Finding the exact per-report limit
 
