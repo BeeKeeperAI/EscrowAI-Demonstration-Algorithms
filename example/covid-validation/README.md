@@ -248,8 +248,9 @@ Two platform behaviours to be aware of when reading multi-report runs:
   The destroy pipeline for a CVM run has two stages (`terraform_validate`, then
   `terraform_destroy`), each a separate Azure DevOps job that must acquire an agent, check out
   the repo, install terraform, run `terraform init` against remote state, and then destroy the
-  VM, NIC, disk and public IP. That is typically in the range of 5 to 10 minutes end to end,
-  but it has not been measured here and it varies with agent-pool availability. To measure it
+  VM, NIC, disk and public IP. On staging that looked like 5 to 10 minutes end to end, but on
+  Dev on 2026-11-23 the algorithm was dead 60 to 90 s after the run ended (scenario 6), so the
+  window varies by environment and agent-pool availability. To measure it
   on a given environment, run with `REPORT_INTERVAL_SECONDS` set (for example `REPORT_COUNT=3`
   and `REPORT_INTERVAL_SECONDS=240`) and compare the timestamp of the first report against the
   `VM Destroyed` line that the pipeline posts to the run log. Reports whose sleep ends after
@@ -355,48 +356,70 @@ that types `report` as a dict. The harness treats the rejection as the expected 
 and continues with report 50. Its exit code and closing log status stay as for a clean run, so
 everything that happens to the run afterwards is the platform's doing, not the harness's.
 
-Predicted from the code (EnclaveAPI `PostApiV1Report`, backend `frontoffice_log` and
-`frontoffice_report` views), to be confirmed on Dev:
+Observed on Dev on 2026-11-23 (EnclaveAPI 2.1.6, `Standard_DC4as_v5`, run configuration 3,
+version 1), which matched the sequence predicted from the code (EnclaveAPI `PostApiV1Report`,
+backend `frontoffice_log` and `frontoffice_report` views) except for point 5:
 
-1. **Reports 1 to 48** are validated, tagged and stored as `In Progress`, as in scenario 5.
-2. **Report 49** is sent to Cerberus, fails, and EnclaveAPI answers `400` with the Cerberus
-   message. The report is never forwarded, so there is no row for it. The harness run log shows
-   `Report 49/100 was deliberately invalid (schema) and was rejected as intended: HTTP 400`.
-3. **The run is marked failed right there.** Alongside the 400, EnclaveAPI posts an internal log
-   line `AO: Your report failed schema validation: ...` with status **`Failed`**. The backend
-   treats a `Failed` log line as an end state exactly like a `Failed` report: run status becomes
-   `run-failed`, the end date is set, the failure notification and email go out, and the VM
-   destroy pipeline is queued. That happens about 30 seconds into the sequence, before report 50
-   is posted.
-4. **Reports 50 to 100 are still accepted and stored.** The harness keeps posting, EnclaveAPI
-   validates and forwards them, and the backend stores them. But because the run has ended,
-   the backend rewrites the status of every later report and log to the run's end status, so
-   reports 50 to 100 are stored with status `Failed` rather than `In Progress`, and the final
-   report's `Completed` is rewritten to `Failed` too. They remain tagged `validated_report`, so
-   they are listed in Report Details (first 15 only, see above) with status `Failed`.
-5. **Nothing is lost to the destroy race** at this size: the remaining 51 reports take about
-   35 seconds and the destroy pipeline takes minutes. With larger or slower reports, anything
-   still posting when the VM goes away is lost, as in scenario 4.
-6. **Harness exit and VM runner.** The harness exits 0 (the rejection was expected) and posts
-   its closing log line; with the run already ended, its status is rewritten to `Failed`. The
-   VM runner then drains EnclaveAPI and posts `Completed` / `The run has completed`, which is
-   also rewritten to `Failed` and logged as "run already ended, will skip destroy".
+1. **Reports 1 to 48** were validated, tagged and stored as `In Progress`, as in scenario 5, at
+   0.7 to 1.5 s per report.
+2. **Report 49** was sent to Cerberus, failed, and EnclaveAPI answered `400`. The run log shows
+   `AO: Your report failed schema validation: Schema validation failed: map[report:[must be of
+   dict type]]` followed by the harness line `Report 49/100 was deliberately invalid (schema) and
+   was rejected as intended: HTTP 400 Bad Request. Continuing with the next report.` The report
+   was never forwarded, so there is no row for it.
+3. **The run was marked failed right there.** The schema-validation log line is posted with
+   status **`Failed`**, and the backend treats a `Failed` log line as an end state exactly like a
+   `Failed` report: run status `run-failed`, end date set, failure notification and email, VM
+   destroy pipeline queued. The downloaded log's `Report generation failed` and `Run failed`
+   rows both carry the 12:32 PM timestamp of report 49, and the UI showed the **Run failed**
+   badge while reports were still being accepted.
+4. **Reports 50 onwards were still accepted and stored.** The harness kept posting, EnclaveAPI
+   validated and forwarded them, and the backend stored them. Because the run had ended, the
+   backend rewrote the status of every later report and log to the run's end status, so they are
+   stored as `Failed` rather than `In Progress`. They remain tagged `validated_report`, so Report
+   Details lists them (first 15 only, see above). Two side effects were visible:
+   - Each post slowed to 1.5 to 5.8 s. After the end date the backend rewrites every incoming
+     report and log to `Failed`, and `Failed` re-enters the end-state branch, so every post now
+     also runs the notification path before returning "run already ended, will skip destroy".
+     That branch also fires a fresh **Run Failed** notification per post. The email is guarded
+     by a sent flag; the notification is not.
+   - EnclaveAPI's `AO: Report N accepted and added to Report Details` counter is its own count
+     of accepted reports, so after the rejection it runs one behind the harness index (`AO:
+     Report 49 accepted` is harness report 50).
+5. **The destroy did cut the run short.** The log ends at harness report 79, accepted at
+   12:33 PM, about 60 to 90 s after the failure. Reports 80 to 100 were never sent: the
+   algorithm died with the VM. The earlier assumption that the destroy pipeline takes minutes
+   did not hold on Dev; combined with the post-failure slowdown, the remaining 51 reports needed
+   about 2.5 minutes and got roughly half of that.
+6. **Harness exit and VM runner** never happened: the process was killed before its closing log
+   line, and the VM runner never reached its drain poll or its `Completed` report. On a run
+   that does survive to the end, both would be stored with status rewritten to `Failed` and
+   logged as "run already ended, will skip destroy".
 
 Net effect: one schema-invalid report anywhere in the sequence fails the whole run, even though
-every other report is stored. The final run status is **Run Failed**, with 48 `In Progress`
-reports, no report 49, and 51 reports whose stored status is `Failed`.
+every other report is stored. The final run status was **Run Failed**, with 48 `In Progress`
+reports, no report 49, 30 reports (50 to 79) whose stored status is `Failed`, and 21 reports
+never sent. The destroy also discards the algorithm's own tail: anything it would have logged or
+posted after the VM went away is simply absent.
 
-Contrast with `REPORT_FAIL_MODE=oversize`: the size pre-check in EnclaveAPI (`00c4739` or later)
-answers `413` and logs the size message with status **`In Progress`**, not `Failed`. The run
-continues, report 49 is simply missing, and the run ends normally on report 100 as
-**Run Completed**. So today a schema failure fails the run and a size failure does not. Whether
-a rejected intermediate report should fail a run at all is a platform decision; the algorithm
-receives the 400 and could repair and resend, but the `Failed` log line has already ended the run
-by the time it does.
+Contrast with `REPORT_FAIL_MODE=oversize` (not yet run): the size pre-check in EnclaveAPI
+(`00c4739` or later) answers `413` and logs the size message with status **`In Progress`**, not
+`Failed`. The run should continue, report 49 is simply missing, and the run ends normally on
+report 100 as **Run Completed**. So today a schema failure fails the run and a size failure does
+not. Whether a rejected intermediate report should fail a run at all is a platform decision; the
+algorithm receives the 400 and could repair and resend, but the `Failed` log line has already
+ended the run by the time it does.
 
-Things to check after the Dev run: the run status badge, the Date Ended (it should match the
-report 49 timestamp, not report 100), the stored status of reports 50 to 100 via the report
-endpoint, and whether a failure email arrived.
+Still to check from the 2026-11-23 run: the stored status of reports 50 to 79 via the report
+endpoint (expected `Failed`), the number of **Run Failed** notifications in the bell (expected
+one per post after report 49, about 60), and whether exactly one failure email arrived. Reading
+the run log in the UI mid-run shows only the first page of log lines under the synthetic
+`Run failed` row, so use **Download logs** for the complete sequence.
+
+The destroy timing is the variable to pin down before relying on anything in point 5. On this
+Dev run the VM was gone 60 to 90 s after the failing report. The destroy pipeline notes under
+"Two platform behaviours" above assume 5 to 10 minutes, which came from staging on 2026-11-03
+and does not transfer to Dev.
 
 ### Finding the exact per-report limit
 
