@@ -4,8 +4,8 @@ Report size / count test harness for the EnclaveAPI report endpoint.
 This algorithm does no model validation. It builds N JSON reports of a
 configurable size and posts each one through the EnclaveSDK Report API
 (the same ``api_v1_report_post`` call the original COVID validation used),
-always with status "Completed". It is used to verify how many reports, and
-of what size, the EnclaveAPI report endpoint accepts.
+with configurable statuses. It is used to verify how many reports, and of
+what size, the EnclaveAPI report endpoint accepts.
 
 Environment variables
 ---------------------
@@ -23,7 +23,20 @@ REPORT_INTERMEDIATE_STATUS
                  "Completed" and ends the run. Set to "Completed" to reproduce
                  the original all-Completed behaviour, where the first report
                  ends the run and later reports race the VM destroy.
+REPORT_FINAL_STATUS
+                 Status of the last report. Default: "Completed", which ends
+                 the run. Set to "In Progress" to post every report as
+                 "In Progress"; the harness's closing log line is then also
+                 posted as "In Progress" (a "Completed" log line ends the run
+                 too), so the run only ends when the VM runner posts its own
+                 "Completed" report after the algorithm container exits.
 ENCLAVE_URL      EnclaveAPI base URL. Default: https://enclaveapi.escrow.beekeeperai.com/
+
+Status values are matched ignoring case, spaces, underscores and hyphens, so
+"InProgress", "in_progress" and "in-progress" all mean "In Progress". Use one
+of those spellings in an EscrowAI run configuration: the platform exports run
+parameters through an unquoted shell ``export KEY=value``, which splits
+"In Progress" at the space and delivers only "In".
 """
 
 import json
@@ -57,8 +70,26 @@ ENCLAVE_URL = os.getenv("ENCLAVE_URL", "https://enclaveapi.escrow.beekeeperai.co
 REPORT_SIZE_MB = float(os.getenv("REPORT_SIZE_MB", "1"))
 REPORT_COUNT = int(os.getenv("REPORT_COUNT", "1"))
 REPORT_INTERVAL_SECONDS = float(os.getenv("REPORT_INTERVAL_SECONDS", "0"))
-REPORT_INTERMEDIATE_STATUS = os.getenv("REPORT_INTERMEDIATE_STATUS", "In Progress").strip()
-VALID_INTERMEDIATE_STATUSES = ("In Progress", "Completed")
+VALID_REPORT_STATUSES = ("In Progress", "Completed")
+
+
+def normalize_status(raw: str) -> str:
+    """
+    Map any spelling of a report status to the exact value the API expects.
+
+    EscrowAI run parameters reach the container through an unquoted shell
+    ``export KEY=value``, which splits "In Progress" at the space and delivers
+    just "In". So the run configuration has to use a space-free spelling such
+    as ``InProgress`` or ``in_progress``; this accepts those (case, spaces,
+    underscores and hyphens are ignored) and returns "In Progress". Anything
+    unrecognised is returned stripped so the validation below reports it.
+    """
+    key = "".join(ch for ch in raw.lower() if ch.isalnum())
+    return {"inprogress": "In Progress", "completed": "Completed"}.get(key, raw.strip())
+
+
+REPORT_INTERMEDIATE_STATUS = normalize_status(os.getenv("REPORT_INTERMEDIATE_STATUS", "In Progress"))
+REPORT_FINAL_STATUS = normalize_status(os.getenv("REPORT_FINAL_STATUS", "Completed"))
 SCHEMA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema.json")
 
 configuration = EnclaveSDK.Configuration(ENCLAVE_URL)
@@ -154,12 +185,19 @@ def main() -> int:
         log.error("REPORT_INTERVAL_SECONDS must be >= 0 (got %s)", REPORT_INTERVAL_SECONDS)
         post_log(f"Invalid REPORT_INTERVAL_SECONDS={REPORT_INTERVAL_SECONDS}", "Failed")
         return 1
-    if REPORT_INTERMEDIATE_STATUS not in VALID_INTERMEDIATE_STATUSES:
+    if REPORT_INTERMEDIATE_STATUS not in VALID_REPORT_STATUSES:
         log.error(
             "REPORT_INTERMEDIATE_STATUS must be one of %s (got %r)",
-            VALID_INTERMEDIATE_STATUSES, REPORT_INTERMEDIATE_STATUS,
+            VALID_REPORT_STATUSES, REPORT_INTERMEDIATE_STATUS,
         )
         post_log(f"Invalid REPORT_INTERMEDIATE_STATUS={REPORT_INTERMEDIATE_STATUS!r}", "Failed")
+        return 1
+    if REPORT_FINAL_STATUS not in VALID_REPORT_STATUSES:
+        log.error(
+            "REPORT_FINAL_STATUS must be one of %s (got %r)",
+            VALID_REPORT_STATUSES, REPORT_FINAL_STATUS,
+        )
+        post_log(f"Invalid REPORT_FINAL_STATUS={REPORT_FINAL_STATUS!r}", "Failed")
         return 1
 
     target_bytes = int(REPORT_SIZE_MB * MB)
@@ -169,12 +207,18 @@ def main() -> int:
     log.info("REPORT_SIZE_MB = %s (%d bytes per report)", REPORT_SIZE_MB, target_bytes)
     log.info("REPORT_COUNT   = %d", REPORT_COUNT)
     log.info("REPORT_INTERVAL_SECONDS = %s", REPORT_INTERVAL_SECONDS)
-    log.info("REPORT_INTERMEDIATE_STATUS = %s (last report is always Completed)", REPORT_INTERMEDIATE_STATUS)
+    log.info("REPORT_INTERMEDIATE_STATUS = %s", REPORT_INTERMEDIATE_STATUS)
+    log.info("REPORT_FINAL_STATUS = %s", REPORT_FINAL_STATUS)
+    if REPORT_FINAL_STATUS != "Completed":
+        log.info(
+            "No report will be posted as Completed; the run ends when the VM runner posts its "
+            "own Completed report after this container exits"
+        )
     log.info("Planned total  = %.2f MB across %d report(s)", total_planned_mb, REPORT_COUNT)
     post_log(
         f"Starting report size test: {REPORT_COUNT} report(s) x {REPORT_SIZE_MB} MB "
         f"(planned total {total_planned_mb:.2f} MB, {REPORT_INTERVAL_SECONDS}s between reports, "
-        f"intermediate status {REPORT_INTERMEDIATE_STATUS!r})",
+        f"intermediate status {REPORT_INTERMEDIATE_STATUS!r}, final status {REPORT_FINAL_STATUS!r})",
         "In Progress",
     )
 
@@ -195,9 +239,11 @@ def main() -> int:
             post_log(f"Sleeping {REPORT_INTERVAL_SECONDS:.0f}s before report {i}/{REPORT_COUNT}", "In Progress")
             time.sleep(REPORT_INTERVAL_SECONDS)
         name = f"Report Size Test {i}/{REPORT_COUNT} ({REPORT_SIZE_MB} MB)"
-        # Only the last report ends the run. Earlier ones use the configured
-        # intermediate status so they are stored without triggering the VM destroy.
-        report_status = "Completed" if i == REPORT_COUNT else REPORT_INTERMEDIATE_STATUS
+        # By default only the last report is Completed and ends the run. Earlier
+        # ones use the intermediate status so they are stored without triggering
+        # the VM destroy. REPORT_FINAL_STATUS="In Progress" makes every report
+        # In Progress and leaves ending the run to the VM runner.
+        report_status = REPORT_FINAL_STATUS if i == REPORT_COUNT else REPORT_INTERMEDIATE_STATUS
         log.info("--- Report %d/%d: building payload ---", i, REPORT_COUNT)
         t_build = time.perf_counter()
         json_data = build_json_data(i, target_bytes)
@@ -274,7 +320,9 @@ def main() -> int:
         successes, REPORT_COUNT, failures, bytes_sent_ok / MB, total_planned_mb,
     )
 
-    final_status = "Completed" if failures == 0 else "Failed"
+    # A "Completed" log line ends the run just like a "Completed" report does, so
+    # when no report is meant to end the run the closing log stays "In Progress".
+    final_status = REPORT_FINAL_STATUS if failures == 0 else "Failed"
     post_log(
         f"Report size test finished: accepted {successes}/{REPORT_COUNT} x {REPORT_SIZE_MB} MB "
         f"(accepted total {bytes_sent_ok / MB:.2f} MB, planned {total_planned_mb:.2f} MB)",

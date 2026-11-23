@@ -1,7 +1,7 @@
 # EnclaveAPI Report Size Limit Test - EscrowAI Example
 
 This example is a test harness for the EnclaveAPI report endpoint. It posts a configurable
-number of reports of a configurable size, each with status `Completed`, using the same
+number of reports of a configurable size, with configurable statuses, using the same
 `api_v1_report_post` call that the original COVID-19 validation algorithm used. It is used to
 verify the file size limit enforced by the report endpoint and whether the 100 MB limit applies
 to each individual report or to the combined total of all reports posted by a run.
@@ -15,21 +15,39 @@ No model, data download, or validation logic is included.
 | `REPORT_SIZE_MB` | No       | `1`                                         | Size of each report's `json_data` payload in MB. Decimals allowed.  |
 | `REPORT_COUNT`   | No       | `1`                                         | Number of reports to post in the run.                               |
 | `REPORT_INTERVAL_SECONDS` | No | `0`                                       | Seconds to sleep between consecutive report posts. Use it to measure how long the VM survives after the first `Completed` report. |
-| `REPORT_INTERMEDIATE_STATUS` | No | `In Progress`                          | Status of every report except the last, which is always `Completed`. `In Progress` is how a real algorithm posts several validated reports. Set to `Completed` to reproduce the original all-Completed runs. |
+| `REPORT_INTERMEDIATE_STATUS` | No | `In Progress`                          | Status of every report except the last. `In Progress` is how a real algorithm posts several validated reports. Set to `Completed` to reproduce the original all-Completed runs. |
+| `REPORT_FINAL_STATUS` | No  | `Completed`                                 | Status of the last report. Set to `InProgress` to post every report as `In Progress`; the closing log line is then also `In Progress` and the run ends only when the VM runner posts its own `Completed` report after the container exits. |
 | `ENCLAVE_URL`    | No       | `https://enclaveapi.escrow.beekeeperai.com/` | EnclaveAPI base URL.                                                |
+
+Status values are matched ignoring case, spaces, underscores and hyphens, so `InProgress`,
+`in_progress` and `in-progress` all mean `In Progress`. **In an EscrowAI run configuration use
+a space-free spelling.** The platform turns run parameters into environment variables with an
+unquoted shell `export KEY=value` (`entrypoint.sh` in the algorithm build pipeline, and the
+runtime downloader), which splits `In Progress` at the space and delivers only `In`. The
+harness then exits with code 1 and logs `REPORT_FINAL_STATUS must be one of ... (got 'In')`.
+
+Typing the value with double quotes in the run configuration form, `"In Progress"`, also works
+when the algorithm image was built by the `algo-runtime-containerbuild` pipeline: its entrypoint
+sources the `training_parameters_env` file the downloader writes, so the shell removes the
+quotes and the variable is exactly `In Progress`. That is how to run an image built before
+status normalisation was added. It does not work with the older entrypoint in
+`bkservices-template/azure-pipelines/entrypoint.sh`, which does `export $line` per parameter
+and never re-parses quotes. A space-free spelling works on both paths, so prefer it.
 
 ## What the Algorithm Does
 
 1. Reads `REPORT_SIZE_MB` and `REPORT_COUNT` and logs the planned run (per-report size, count, planned total).
 2. For each report, builds a `json_data` dict padded with printable characters so that its
-   serialized JSON size equals the requested size, then posts it with `status: "Completed"`.
+   serialized JSON size equals the requested size, then posts it with `REPORT_INTERMEDIATE_STATUS`
+   (default `In Progress`) or, for the last report, `REPORT_FINAL_STATUS` (default `Completed`).
 3. Logs the outcome of every post: accepted (with response and elapsed time) or rejected
    (HTTP status, reason, and the first 500 characters of the response body).
 4. Continues to the next report after a rejection, so a run shows exactly which report in the
    sequence was the first to fail.
-5. Prints a summary table and posts a final log line with status `Completed` (all accepted)
-   or `Failed` (at least one rejection). Exit code is `0` on full success, `2` if any report
-   was rejected, `1` for invalid configuration.
+5. Prints a summary table and posts a final log line with status `REPORT_FINAL_STATUS` (all
+   accepted) or `Failed` (at least one rejection). A `Completed` log line ends the run just like
+   a `Completed` report, which is why the closing log follows the final report status. Exit code
+   is `0` on full success, `2` if any report was rejected, `1` for invalid configuration.
 
 All milestones are also posted to the Enclave Log API so they appear in the EscrowAI run log.
 
@@ -237,13 +255,21 @@ Two platform behaviours to be aware of when reading multi-report runs:
 
   Observed in staging on 2026-11-03: a run with `REPORT_COUNT=10` posted back to back ended
   with 5 reports stored and no rejection lines in the run log. That is consistent with the VM
-  being destroyed while report 6 was in flight, roughly 5 to 8 minutes after report 1. A second
-  run the same day with `REPORT_SIZE_MB=5` and `REPORT_COUNT=100` stored 15 reports (about
-  75 MB in total) before the cutoff. Taken together: the cutoff is neither a report count nor a
-  cumulative size, because 5 reports totalling about 499 MB and 15 reports totalling about
-  75 MB were cut off at roughly the same elapsed time. It is the VM lifetime after the first
-  `Completed` report. Any algorithm that keeps posting after its first `Completed` report is
-  subject to the same cutoff.
+  being destroyed while report 6 was in flight, roughly 5 to 8 minutes after report 1. The
+  cutoff is the VM lifetime after the first `Completed` report, not a report count or a
+  cumulative size. Any algorithm that keeps posting after its first `Completed` report is
+  subject to it.
+- **Report Details shows at most 15 reports.** The web UI's Report Details modal requests the
+  first page of reports with a page size of 15 and has no pager for that list
+  (`beekeeper-web-frontend`, `src/lib/hooks/run-configurations/use-run-configurations.ts`,
+  `PAGE_SIZE = 15`). The backend report list is unpaginated unless the UI passes `page_size`,
+  so every report is stored and reachable; the UI just does not show rows beyond 15. A run on
+  Dev on 2026-11-16 with `REPORT_SIZE_MB=1`, `REPORT_COUNT=100` and the default `In Progress`
+  intermediates had all 100 posts accepted in the run log and "15 reports available" in Report
+  Details. The staging run on 2026-11-03 with `REPORT_SIZE_MB=5` and `REPORT_COUNT=100`, which
+  also showed 15, was most likely the same display cap rather than the destroy race. To count
+  stored reports, query the report endpoint for the run with `page=2&page_size=15`, or without
+  a page size, instead of counting rows in the modal.
 - Every log posted after the run has ended has its status overwritten to `Completed` by the
   backend, and the web UI's run log download drops all logs with that status. So the script's
   "accepted" and summary lines for a multi-report run are stored but do not appear in the
@@ -268,21 +294,41 @@ posted as `In Progress`, only the last one as `Completed`.
 ```
 REPORT_SIZE_MB=1
 REPORT_COUNT=100
-REPORT_INTERMEDIATE_STATUS="In Progress"   # the default
+REPORT_INTERMEDIATE_STATUS=InProgress   # the default; do not set it with a space in a run configuration
 ```
 
 Planned total: 100 MB, but the backend only ever holds one 1 MB report in memory at a time.
 
 Expected with an EnclaveAPI build that validates and tags `In Progress` reports (branch
-`kurian/disk-mode-decryption`, commit `00c4739` or later): all 100 reports stored, all 100
-listed in Report Details, the run ends only after report 100, and no VM-destroy race because
-nothing ends the run early. Reports 1 to 99 appear with status `In Progress` and report 100
-with `Completed`.
+`kurian/disk-mode-decryption`, commit `00c4739` or later): all 100 reports stored, the run ends
+only after report 100, and no VM-destroy race because nothing ends the run early. Reports 1 to
+99 are stored with status `In Progress` and report 100 with `Completed`. In the run log every
+intermediate report is preceded by the EnclaveAPI line "Intermediate report received and
+validation is starting"; the last one by "Report has been generated and validation is
+starting". Report Details lists only the first 15 (see the display cap above).
+
+Confirmed on Dev on 2026-11-16: 99 `In Progress` reports and 1 `Completed` report, all
+accepted, 99 posts in about 65 seconds, run ended on report 100.
 
 With an older EnclaveAPI build the same run still stores all 100 reports, but Report Details
-lists only report 100, because only `Completed` reports were tagged `validated_report`. Count
-the rows in the backend report table, or query the report endpoint for the run, to confirm the
-other 99 arrived.
+lists only report 100, because only `Completed` reports were tagged `validated_report`. Query
+the report endpoint for the run to confirm the other 99 arrived.
+
+#### Variant: every report `In Progress`
+
+```
+REPORT_SIZE_MB=1
+REPORT_COUNT=100
+REPORT_FINAL_STATUS=InProgress
+```
+
+No report, and no harness log line, carries status `Completed`, so nothing the algorithm sends
+ends the run. The run still ends: when the container exits with code 0 the VM runner drains
+EnclaveAPI and posts its own `Completed` report ("The run has completed"), which sets the run's
+end date and queues the destroy. Expected: all 100 reports stored as `In Progress`, the harness
+summary lines visible in the run log (they are posted before the run ends, so their status is
+not overwritten), and the run marked completed by the VM runner's report shortly after the
+container exits. This is the shape of an algorithm that never posts a final report itself.
 
 If Dev or QA still fails partway through, the failure is a per-request cost on the backend
 (one report row, one base64 decode, one schema validation, and one Report Details query per
