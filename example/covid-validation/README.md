@@ -410,6 +410,12 @@ not. Whether a rejected intermediate report should fail a run at all is a platfo
 algorithm receives the 400 and could repair and resend, but the `Failed` log line has already
 ended the run by the time it does.
 
+The reports CSV export for the run (`Run Configuration 3_run_version_1_reports_csv.zip`) held
+78 files of 1,024 KB each, numbered `report_1` to `report_78`: 48 from before the failure and 30
+after it, report 49 absent. The export numbers stored reports in sequence, so `report_49` in the
+zip is harness report 50. It confirms the count without the API and without the 15-row modal
+cap, but it carries the report bodies only, not their stored status.
+
 Still to check from the 2026-11-23 run: the stored status of reports 50 to 79 via the report
 endpoint (expected `Failed`), the number of **Run Failed** notifications in the bell (expected
 one per post after report 49, about 60), and whether exactly one failure email arrived. Reading
