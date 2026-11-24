@@ -17,8 +17,12 @@ No model, data download, or validation logic is included.
 | `REPORT_INTERVAL_SECONDS` | No | `0`                                       | Seconds to sleep between consecutive report posts. Use it to measure how long the VM survives after the first `Completed` report. |
 | `REPORT_INTERMEDIATE_STATUS` | No | `In Progress`                          | Status of every report except the last. `In Progress` is how a real algorithm posts several validated reports. Set to `Completed` to reproduce the original all-Completed runs. |
 | `REPORT_FINAL_STATUS` | No  | `Completed`                                 | Status of the last report. Set to `InProgress` to post every report as `In Progress`; the closing log line is then also `In Progress` and the run ends only when the VM runner posts its own `Completed` report after the container exits. |
-| `REPORT_FAIL_AT` | No       | none                                        | Comma-separated 1-based indexes of reports to post deliberately invalid, e.g. `49` or `49,50`. A rejection of one of these is the expected outcome and does not fail the harness. |
+| `REPORT_FAIL_AT` | No       | none                                        | Comma-separated 1-based indexes of reports to post deliberately invalid, e.g. `49` or `49,50`. The rejection is logged as intended, but it is a hard failure for the platform, so the harness stops there (unless `REPORT_CONTINUE_ON_REJECT`) and exits 2. |
 | `REPORT_FAIL_MODE` | No     | `schema`                                    | `schema` replaces the `report` object with a string so schema validation rejects it (EnclaveAPI 400, not forwarded). `oversize` pads the report past 100 MiB (EnclaveAPI 413 on builds with the size pre-check). Avoid `oversize` on Dev/QA with older EnclaveAPI builds. |
+| `REPORT_CONTINUE_ON_REJECT` | No | `false`                                | By default the harness stops at the first report that is not accepted, as a well-behaved algorithm should. Set to `true` to keep posting the rest anyway, to show what the platform does with an algorithm that ignores the failure. EnclaveAPI builds that refuse work after the run has ended answer 409 to each of those. |
+
+Exit codes: 0 when every report was accepted, 1 for a configuration error, 2 when any report
+was rejected, refused or errored, or a deliberately invalid one was accepted.
 | `ENCLAVE_URL`    | No       | `https://enclaveapi.escrow.beekeeperai.com/` | EnclaveAPI base URL.                                                |
 
 Status values are matched ignoring case, spaces, underscores and hyphens, so `InProgress`,
@@ -348,17 +352,28 @@ REPORT_SIZE_MB=1
 REPORT_COUNT=100
 REPORT_FAIL_AT=49            # or 49,50
 REPORT_FAIL_MODE=schema      # the default
+REPORT_CONTINUE_ON_REJECT=true  # keep posting after the rejection; omit to stop there
 REPORT_FINAL_STATUS=Completed  # the default; use "In Progress" (quoted) for the all-In-Progress variant
 ```
 
 Report 49 is posted with `"report"` set to a string instead of an object, which fails any schema
-that types `report` as a dict. The harness treats the rejection as the expected outcome, logs it,
-and continues with report 50. Its exit code and closing log status stay as for a clean run, so
-everything that happens to the run afterwards is the platform's doing, not the harness's.
+that types `report` as a dict. By default the harness stops at that rejection and exits 2, which
+is what a well-behaved algorithm does once the platform has failed the run. With
+`REPORT_CONTINUE_ON_REJECT=true` it keeps posting reports 50 to 100 regardless, which is the
+misbehaving-algorithm case that shows what the platform does on its own. Both runs below were
+of that second kind (the first because continuing was the only behaviour at the time).
 
-Observed on Dev on 2026-11-23 (EnclaveAPI 2.1.6, `Standard_DC4as_v5`, run configuration 3,
-version 1), which matched the sequence predicted from the code (EnclaveAPI `PostApiV1Report`,
-backend `frontoffice_log` and `frontoffice_report` views) except for point 5:
+The decision this scenario led to: **a rejected report is a hard failure and ends the run, and
+once the run has ended EnclaveAPI refuses all further work.** A schema mismatch or an oversize
+report is a defect in the algorithm's code; there is nobody at the keyboard to fix it in flight,
+so retrying is pointless and skipping is worse than stopping. The harness default follows that
+rule, and EnclaveAPI was changed to enforce it (see the 2026-11-24 run).
+
+#### 2026-11-23, EnclaveAPI 2.1.6: the run fails but the algorithm is not stopped
+
+Observed on Dev (`Standard_DC4as_v5`, run configuration 3, version 1), which matched the
+sequence predicted from the code (EnclaveAPI `PostApiV1Report`, backend `frontoffice_log` and
+`frontoffice_report` views) except for point 5:
 
 1. **Reports 1 to 48** were validated, tagged and stored as `In Progress`, as in scenario 5, at
    0.7 to 1.5 s per report.
@@ -402,30 +417,72 @@ reports, no report 49, 30 reports (50 to 79) whose stored status is `Failed`, an
 never sent. The destroy also discards the algorithm's own tail: anything it would have logged or
 posted after the VM went away is simply absent.
 
-Contrast with `REPORT_FAIL_MODE=oversize` (not yet run): the size pre-check in EnclaveAPI
-(`00c4739` or later) answers `413` and logs the size message with status **`In Progress`**, not
-`Failed`. The run should continue, report 49 is simply missing, and the run ends normally on
-report 100 as **Run Completed**. So today a schema failure fails the run and a size failure does
-not. Whether a rejected intermediate report should fail a run at all is a platform decision; the
-algorithm receives the 400 and could repair and resend, but the `Failed` log line has already
-ended the run by the time it does.
-
 The reports CSV export for the run (`Run Configuration 3_run_version_1_reports_csv.zip`) held
 78 files of 1,024 KB each, numbered `report_1` to `report_78`: 48 from before the failure and 30
 after it, report 49 absent. The export numbers stored reports in sequence, so `report_49` in the
 zip is harness report 50. It confirms the count without the API and without the 15-row modal
 cap, but it carries the report bodies only, not their stored status.
 
-Still to check from the 2026-11-23 run: the stored status of reports 50 to 79 via the report
-endpoint (expected `Failed`), the number of **Run Failed** notifications in the bell (expected
-one per post after report 49, about 60), and whether exactly one failure email arrived. Reading
-the run log in the UI mid-run shows only the first page of log lines under the synthetic
-`Run failed` row, so use **Download logs** for the complete sequence.
+On the 2.1.6 image the oversize case did not match: the size pre-check from `00c4739` answered
+`413` and logged its message with status **`In Progress`**, so an oversize report left the run
+running while a schema-invalid one failed it. Both are deterministic code defects, so the
+EnclaveAPI change below makes the 413 log line `Failed` as well.
 
-The destroy timing is the variable to pin down before relying on anything in point 5. On this
-Dev run the VM was gone 60 to 90 s after the failing report. The destroy pipeline notes under
-"Two platform behaviours" above assume 5 to 10 minutes, which came from staging on 2026-11-03
-and does not transfer to Dev.
+The destroy timing on Dev was 60 to 90 s from the failing report to the algorithm being killed.
+The destroy pipeline notes under "Two platform behaviours" above assume 5 to 10 minutes, which
+came from staging on 2026-11-03 and does not transfer to Dev.
+
+#### 2026-11-24, EnclaveAPI with hard-failure handling: the run ends cleanly
+
+EnclaveAPI was changed (the hard-failure change set requested on 2026-11-24, built on top of
+`kurian/stall-timeout`) so that every hard failure it reports with status `Failed` also sets a
+run-ended flag, after which the report and log endpoints
+answer `409 Conflict` with `{"error":"run ended","reason":"a report failed schema validation",
+"message":"The run was marked failed after a report failed schema validation. No further reports
+or logs are accepted."}` and forward nothing. The failing report's own 400/413 body says the run
+has been marked failed, the oversize 413 now logs `Failed`, and the ping response carries
+`run_ended` and `run_end_reason` for the VM runner. The sandbox never sets the flag.
+
+Same scenario, same parameters, harness still continuing after the rejection (the stop-on-reject
+default did not exist yet), observed on Dev:
+
+1. Reports 1 to 48 accepted at about 0.65 s each.
+2. Report 49 rejected with the schema message; run marked failed at 2:59 PM.
+3. Reports 50 to 100 all answered `409` in 0.01 s each. Nothing forwarded, so the run log stops
+   at the failure line. The harness's closing log post was refused as well and only reached the
+   platform through the VM runner shipping the container's last stdout lines.
+4. The harness exited 2 (51 reports not accepted). The VM runner posted `Algorithm container
+   exited with non-zero exit code 2` at 3:00 PM, the only line after the failure.
+
+| | 2026-11-23 (2.1.6) | 2026-11-24 (hard-failure build) |
+|---|---|---|
+| Reports stored | 78 | 48 |
+| Failure to algorithm stopped | 60 to 90 s, by the destroy | under 1 s of 409s, then exit |
+| Posts processed after the failure | 30, each 2 to 6 s | 51, each 0.01 s, none forwarded |
+| Run Failed notifications expected | about 60 | 1, plus the VM runner's two end-of-run posts |
+
+The proof runs for this behaviour, each from a build of this branch:
+
+| Run | Parameters | What proves it |
+|---|---|---|
+| A | `REPORT_COUNT=100`, `REPORT_FAIL_AT=49` | Log ends at 49 with the "run has been marked failed" message, harness stops and exits 2, VM runner posts its Failed lines, run ends within seconds. Export has 48 files. One notification, one email. |
+| B | A plus `REPORT_CONTINUE_ON_REJECT=true` | Harness logs a 409 for every report from 50 on. Export still 48 files, log does not grow after 49, still one notification. Done on 2026-11-24, above. |
+| C | A plus `REPORT_FAIL_MODE=oversize` | Same outcome as A, with the 413 size message in place of the schema one. |
+
+Run B is the one that proves the platform fix on its own, because the algorithm misbehaves on
+purpose and the run still ends cleanly. Run A proves the harness default. Without a VM runner
+change the algorithm in run B keeps getting 409s until the destroy lands, which is harmless.
+
+Still to check: the stored status of reports 50 to 79 from the 2026-11-23 run via the report
+endpoint (expected `Failed`), the notification counts for both runs, and that exactly one failure
+email arrived each time. Reading the run log in the UI mid-run shows only the first page of log
+lines under the synthetic `Run failed` row, so use **Download logs** for the complete sequence.
+
+Still open on the platform side: the backend re-enters its end-state branch for every post whose
+status it rewrote to `Failed` after the end date, which is what produced the duplicate
+notifications on 2026-11-23 and still applies to the VM runner's two end-of-run posts; and the VM
+runner does not yet read `run_ended` from the ping response to stop the algorithm container
+promptly.
 
 ### Finding the exact per-report limit
 

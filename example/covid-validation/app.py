@@ -33,10 +33,9 @@ REPORT_FINAL_STATUS
 REPORT_FAIL_AT   Comma-separated 1-based indexes of reports to post deliberately
                  invalid, for example "49" or "49,50". Default: none. Used to
                  observe what the platform does when one report in a sequence
-                 is rejected. A rejection of one of these reports counts as the
-                 expected outcome; the harness only exits non-zero when an
-                 outcome is unexpected (an injected report accepted, or a
-                 normal report rejected).
+                 is rejected. The harness still records such a rejection as
+                 "as intended", but a rejected report is a hard failure for
+                 the platform, so the run is over and the harness exits 2.
 REPORT_FAIL_MODE How an injected report is made invalid. "schema" (default)
                  replaces the "report" object with a string, which fails any
                  schema that types "report" as a dict, so EnclaveAPI answers
@@ -44,7 +43,21 @@ REPORT_FAIL_MODE How an injected report is made invalid. "schema" (default)
                  the 100 MiB per-report limit, so an EnclaveAPI build with the
                  size pre-check answers 413; an older build forwards ~134 MB
                  of base64 to the backend, which Dev and QA cannot decode.
+REPORT_CONTINUE_ON_REJECT
+                 Default: false. By default the harness stops at the first
+                 report that is not accepted, whether injected or not, and
+                 exits 2: that is what a well-behaved algorithm does, because
+                 EnclaveAPI has already failed the run. Set to "true" to keep
+                 posting the remaining reports anyway, to show what the
+                 platform does with an algorithm that ignores the failure. An
+                 EnclaveAPI build that refuses work after the run has ended
+                 answers 409 "run ended" to each of those; the harness counts
+                 them separately as "refused after run ended".
 ENCLAVE_URL      EnclaveAPI base URL. Default: https://enclaveapi.escrow.beekeeperai.com/
+
+Exit codes: 0 when every report was accepted, 1 for a configuration error, 2
+when any report was rejected, refused or errored, or an injected report was
+accepted.
 
 Status values are matched ignoring case, spaces, underscores and hyphens, so
 "InProgress", "in_progress" and "in-progress" all mean "In Progress". Use one
@@ -107,6 +120,9 @@ REPORT_FINAL_STATUS = normalize_status(os.getenv("REPORT_FINAL_STATUS", "Complet
 REPORT_FAIL_AT_RAW = os.getenv("REPORT_FAIL_AT", "")
 REPORT_FAIL_MODE = os.getenv("REPORT_FAIL_MODE", "schema").strip().lower()
 VALID_FAIL_MODES = ("schema", "oversize")
+REPORT_CONTINUE_ON_REJECT = os.getenv("REPORT_CONTINUE_ON_REJECT", "false").strip().lower() in ("1", "true", "yes", "on")
+# EnclaveAPI builds that refuse work once the run has ended answer with this.
+HTTP_RUN_ENDED = 409
 # One MiB past the backend's 100 MiB per-report limit on the decoded JSON.
 OVERSIZE_TARGET_BYTES = 101 * MB
 SCHEMA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema.json")
@@ -268,11 +284,16 @@ def main() -> int:
     log.info("Planned total  = %.2f MB across %d report(s)", total_planned_mb, REPORT_COUNT)
     if fail_at:
         log.info("REPORT_FAIL_AT = %s (mode %s): these reports are posted deliberately invalid", sorted(fail_at), REPORT_FAIL_MODE)
+    log.info(
+        "REPORT_CONTINUE_ON_REJECT = %s (%s)", REPORT_CONTINUE_ON_REJECT,
+        "keep posting after a rejection" if REPORT_CONTINUE_ON_REJECT else "stop at the first rejection",
+    )
     post_log(
         f"Starting report size test: {REPORT_COUNT} report(s) x {REPORT_SIZE_MB} MB "
         f"(planned total {total_planned_mb:.2f} MB, {REPORT_INTERVAL_SECONDS}s between reports, "
         f"intermediate status {REPORT_INTERMEDIATE_STATUS!r}, final status {REPORT_FINAL_STATUS!r}"
         + (f", deliberately invalid report(s) {sorted(fail_at)} via {REPORT_FAIL_MODE}" if fail_at else "")
+        + (", continuing after rejections" if REPORT_CONTINUE_ON_REJECT else ", stopping at the first rejection")
         + ")",
         "In Progress",
     )
@@ -281,8 +302,29 @@ def main() -> int:
     failures = 0            # normal reports rejected or errored
     expected_rejections = 0  # injected reports rejected, as intended
     unexpected_accepts = 0   # injected reports accepted, which should not happen
+    refused_after_end = 0    # 409 "run ended" answers from EnclaveAPI
+    stopped_at = None        # report index at which the harness stopped early
     bytes_sent_ok = 0
     results = []
+
+    def stop_here(index: int, why: str) -> bool:
+        """
+        Decide whether to stop after a report that was not accepted. Logs the
+        decision either way. Returns True when the loop should break.
+        """
+        if REPORT_CONTINUE_ON_REJECT:
+            log.info("Report %d/%d: %s. REPORT_CONTINUE_ON_REJECT is set, continuing with the next report.", index, REPORT_COUNT, why)
+            return False
+        log.error(
+            "Report %d/%d: %s. Stopping here: EnclaveAPI has failed the run and nothing posted after this "
+            "point is accepted. Set REPORT_CONTINUE_ON_REJECT=true to keep posting anyway.",
+            index, REPORT_COUNT, why,
+        )
+        post_log(
+            f"Report {index}/{REPORT_COUNT}: {why}. Stopping: the run is over once a report is rejected.",
+            "In Progress",
+        )
+        return True
 
     for i in range(1, REPORT_COUNT + 1):
         if i > 1 and REPORT_INTERVAL_SECONDS > 0:
@@ -372,7 +414,19 @@ def main() -> int:
         except ApiException as exc:
             elapsed = time.perf_counter() - t_post
             body_preview = (exc.body or "")[:500] if isinstance(exc.body, str) else str(exc.body)[:500]
-            if inject:
+            if exc.status == HTTP_RUN_ENDED:
+                # EnclaveAPI has already failed the run and refuses further work.
+                # Nothing was validated or forwarded; the platform never sees this report.
+                refused_after_end += 1
+                log.warning(
+                    "Report %d/%d: REFUSED in %.2fs, the run has already ended. HTTP %s %s. Body: %s",
+                    i, REPORT_COUNT, elapsed, exc.status, exc.reason, body_preview,
+                )
+                results.append({"index": i, "bytes": body_bytes, "result": "refused HTTP 409 (run ended)", "seconds": round(elapsed, 2)})
+                if stop_here(i, "refused because the run has ended"):
+                    stopped_at = i
+                    break
+            elif inject:
                 expected_rejections += 1
                 log.info(
                     "Report %d/%d: rejected as intended in %.2fs. HTTP %s %s. Body: %s",
@@ -380,10 +434,13 @@ def main() -> int:
                 )
                 post_log(
                     f"Report {i}/{REPORT_COUNT} was deliberately invalid ({REPORT_FAIL_MODE}) and was rejected "
-                    f"as intended: HTTP {exc.status} {exc.reason}. Continuing with the next report.",
+                    f"as intended: HTTP {exc.status} {exc.reason}.",
                     "In Progress",
                 )
                 results.append({"index": i, "bytes": body_bytes, "result": f"rejected HTTP {exc.status} (expected)", "seconds": round(elapsed, 2)})
+                if stop_here(i, "deliberately invalid report rejected"):
+                    stopped_at = i
+                    break
             else:
                 failures += 1
                 log.error(
@@ -396,6 +453,9 @@ def main() -> int:
                     "In Progress",
                 )
                 results.append({"index": i, "bytes": body_bytes, "result": f"rejected HTTP {exc.status}", "seconds": round(elapsed, 2)})
+                if stop_here(i, f"rejected with HTTP {exc.status}"):
+                    stopped_at = i
+                    break
         except Exception as exc:  # noqa: BLE001 - connection errors, timeouts, etc.
             elapsed = time.perf_counter() - t_post
             if inject:
@@ -404,10 +464,13 @@ def main() -> int:
                 log.warning("Report %d/%d: error after %.2fs on a deliberately invalid report: %s: %s", i, REPORT_COUNT, elapsed, type(exc).__name__, exc)
                 post_log(
                     f"Report {i}/{REPORT_COUNT} was deliberately invalid ({REPORT_FAIL_MODE}) and failed with "
-                    f"{type(exc).__name__}: {exc}. Continuing with the next report.",
+                    f"{type(exc).__name__}: {exc}.",
                     "In Progress",
                 )
                 results.append({"index": i, "bytes": body_bytes, "result": f"error {type(exc).__name__} (injected failure)", "seconds": round(elapsed, 2)})
+                if stop_here(i, f"deliberately invalid report failed with {type(exc).__name__}"):
+                    stopped_at = i
+                    break
             else:
                 failures += 1
                 log.exception("Report %d/%d: ERROR after %.2fs: %s", i, REPORT_COUNT, elapsed, exc)
@@ -416,6 +479,9 @@ def main() -> int:
                     "In Progress",
                 )
                 results.append({"index": i, "bytes": body_bytes, "result": f"error {type(exc).__name__}", "seconds": round(elapsed, 2)})
+                if stop_here(i, f"failed with {type(exc).__name__}"):
+                    stopped_at = i
+                    break
 
     # -----------------------------------------------------------------------
     # Summary
@@ -423,31 +489,38 @@ def main() -> int:
     log.info("=== Summary ===")
     for r in results:
         log.info("  report %d: %.2f MB -> %s (%.2fs)", r["index"], r["bytes"] / MB, r["result"], r["seconds"])
+    not_sent = REPORT_COUNT - len(results)
     log.info(
         "Accepted %d/%d report(s); rejected/errored %d; deliberately invalid and rejected %d; "
-        "deliberately invalid but accepted %d; accepted total %.2f MB of planned %.2f MB",
+        "deliberately invalid but accepted %d; refused after run ended %d; not sent %d; "
+        "accepted total %.2f MB of planned %.2f MB",
         successes, REPORT_COUNT, failures, expected_rejections, unexpected_accepts,
-        bytes_sent_ok / MB, total_planned_mb,
+        refused_after_end, not_sent, bytes_sent_ok / MB, total_planned_mb,
     )
+    if stopped_at is not None:
+        log.info("Stopped after report %d/%d; %d report(s) were never sent", stopped_at, REPORT_COUNT, not_sent)
 
-    # Only unexpected outcomes count as a harness failure: a normal report that
-    # was rejected, or an injected report that was accepted. An injected report
-    # being rejected is the point of the scenario, so it does not fail the run
-    # from the harness's side; whatever the platform does about it is the
-    # observation.
-    problems = failures + unexpected_accepts
+    # The run is clean only if every report was accepted. Any report that was
+    # rejected, refused or errored is a hard failure from the platform's point
+    # of view, including a deliberately invalid one: the point of injecting it
+    # is to see the platform end the run, and the harness's exit code agrees
+    # with that. If EnclaveAPI has already ended the run, this closing log line
+    # is refused too and only reaches the run log via the container's stdout.
+    all_accepted = successes == REPORT_COUNT
     # A "Completed" log line ends the run just like a "Completed" report does, so
     # when no report is meant to end the run the closing log stays "In Progress".
-    final_status = REPORT_FINAL_STATUS if problems == 0 else "Failed"
+    final_status = REPORT_FINAL_STATUS if all_accepted else "Failed"
     post_log(
         f"Report size test finished: accepted {successes}/{REPORT_COUNT} x {REPORT_SIZE_MB} MB "
         f"(accepted total {bytes_sent_ok / MB:.2f} MB, planned {total_planned_mb:.2f} MB)"
         + (f"; {expected_rejections} deliberately invalid report(s) rejected as intended" if fail_at else "")
         + (f"; {unexpected_accepts} deliberately invalid report(s) ACCEPTED" if unexpected_accepts else "")
-        + (f"; {failures} normal report(s) rejected or errored" if failures else ""),
+        + (f"; {failures} normal report(s) rejected or errored" if failures else "")
+        + (f"; {refused_after_end} refused after the run ended" if refused_after_end else "")
+        + (f"; stopped after report {stopped_at}, {not_sent} never sent" if stopped_at is not None else ""),
         final_status,
     )
-    return 0 if problems == 0 else 2
+    return 0 if all_accepted else 2
 
 
 if __name__ == "__main__":
